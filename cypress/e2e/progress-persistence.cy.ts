@@ -28,7 +28,7 @@ describe('Progress Persistence', () => {
     cy.url().should('include', '/level/0')
     cy.contains('Start', { timeout: 60000 }).click()
     cy.url().should('include', '/level/1')
-    cy.get('.typewriter-input .monaco-editor', { timeout: 60000 }).should('be.visible')
+    cy.get('.typewriter-input .monaco-editor', { timeout: 30000 }).should('be.visible')
   }
 
   const ensureEditorMode = () => {
@@ -37,7 +37,7 @@ describe('Progress Persistence', () => {
         cy.get('.fa-code').click()
       }
     })
-    cy.get('.codeview .monaco-editor', { timeout: 60000 }).should('be.visible')
+    cy.get('.codeview .monaco-editor', { timeout: 30000 }).should('be.visible')
   }
 
   const enterEditorSolution = () => {
@@ -48,7 +48,7 @@ describe('Progress Persistence', () => {
   }
 
   const waitForTypewriterIdle = () => {
-    cy.get('.typewriter button', { timeout: 60000 }).should('not.be.disabled')
+    cy.get('.typewriter button', { timeout: 30000 }).should('not.be.disabled')
   }
 
   const enterTypewriterSolution = () => {
@@ -66,7 +66,7 @@ describe('Progress Persistence', () => {
   }
 
   const assertCompleted = () => {
-    cy.contains('Level completed', { timeout: 60000 }).should('be.visible')
+    cy.contains('Level completed', { timeout: 30000 }).should('be.visible')
   }
 
   const waitForProgressSave = () => {
@@ -89,9 +89,9 @@ describe('Progress Persistence', () => {
 
   const returnHomeAndBack = () => {
     cy.get('#home-btn').click()
-    cy.get('.level-title', { timeout: 60000 }).first().click({ force: true })
+    cy.get('.level-title', { timeout: 30000 }).first().click({ force: true })
     cy.url().should('include', '/level/0')
-    cy.contains('Start', { timeout: 60000 }).click()
+    cy.contains('Start', { timeout: 30000 }).click()
     cy.url().should('include', '/level/1')
   }
 
