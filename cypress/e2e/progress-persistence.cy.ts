@@ -1,6 +1,8 @@
 describe('Progress Persistence', () => {
   const gameId = Cypress.env('gameId') ?? 'local/GameSkeleton'
-  const gameUrl = `/#/g/${gameId}`
+  const gamePath = gameId.startsWith('g/') ? gameId.slice(2) : gameId
+  const gameKey = `g/${gamePath}`.toLowerCase()
+  const gameUrl = `/#/g/${gamePath}`
 
   const ignoreLeanErrors = () => {
     cy.on('uncaught:exception', (err) => {
@@ -78,12 +80,18 @@ describe('Progress Persistence', () => {
   }
 
   const assertSavedCode = () => {
-    cy.window({ timeout: 60000 }).should((win) => {
-      const getCode = (win as any).__lean4game_getCode as (() => string) | undefined
-      expect(getCode, 'getCode hook').to.be.a('function')
-      const code = getCode ? getCode() : ''
-      expect(code, 'saved code').to.include('rw [h]')
-      expect(code, 'saved code').to.include('rw [g]')
+    cy.location('hash').then((hash) => {
+      const match = hash.match(/world\/([^/]+)\/level\/(\d+)/) || []
+      const worldId = match[1]
+      const levelId = match[2]
+
+      cy.window({ timeout: 60000 }).should((win) => {
+        const progress = JSON.parse(win.localStorage.getItem('game_progress') || '{}')
+        const code =
+          progress.games?.[gameKey]?.data?.[worldId]?.[levelId]?.code ?? ''
+        expect(code, 'saved code').to.include('rw [h]')
+        expect(code, 'saved code').to.include('rw [g]')
+      })
     })
   }
 
@@ -98,6 +106,26 @@ describe('Progress Persistence', () => {
   beforeEach(() => {
     ignoreLeanErrors()
     visitGame()
+  })
+
+  it('saves code field', () => {
+    navigateToFirstLevel()
+    enterEditorSolution()
+    waitForProgressSave()
+
+    cy.location('hash').then((hash) => {
+      const match = hash.match(/world\/([^/]+)\/level\/(\d+)/) || []
+      const worldId = match[1]
+      const levelId = match[2]
+
+      cy.window({ timeout: 60000 }).should((win) => {
+        const progress = JSON.parse(win.localStorage.getItem('game_progress') || '{}')
+        const code =
+          progress.games?.[gameKey]?.data?.[worldId]?.[levelId]?.code ?? ''
+        expect(code).to.include('rw [h]')
+        expect(code).to.include('rw [g]')
+      })
+    })
   })
 
   it('persists editor mode code and completion', () => {
@@ -149,7 +177,6 @@ describe('Progress Persistence', () => {
     cy.window().then((win) => {
       const stored = win.localStorage.getItem('game_progress') ?? ''
       const progress = stored ? JSON.parse(stored) : { games: {} }
-      const gameKey = gameId.toLowerCase()
       if (progress.games?.[gameKey]?.data?.[currentWorldId] && emptyLevelId !== null) {
         delete progress.games[gameKey].data[currentWorldId][emptyLevelId]
       }
@@ -161,12 +188,20 @@ describe('Progress Persistence', () => {
     cy.url().should('include', `/level/${emptyLevelId}`)
 
     ensureEditorMode()
-    cy.window({ timeout: 60000 }).should((win) => {
-      const getCode = (win as any).__lean4game_getCode as (() => string) | undefined
-      expect(getCode, 'getCode hook').to.be.a('function')
-      const code = getCode ? getCode() : ''
-      expect(code, 'should not reuse prior level code').to.not.include('rw [h]')
-      expect(code, 'should not reuse prior level code').to.not.include('rw [g]')
+    cy.location('hash').then((hash) => {
+      const match = hash.match(/world\/([^/]+)\/level\/(\d+)/) || []
+      const worldId = match[1]
+      const levelId = match[2]
+
+      cy.window({ timeout: 60000 }).should((win) => {
+        const progress = JSON.parse(win.localStorage.getItem('game_progress') || '{}')
+        const code =
+          progress.games?.[gameId.toLowerCase()]?.data?.[worldId]?.[levelId]?.code ?? ''
+        expect(code, 'should not reuse prior level code').to.not.include('rw [h]')
+        expect(code, 'should not reuse prior level code').to.not.include('rw [g]')
+      })
     })
   })
+
+
 })
