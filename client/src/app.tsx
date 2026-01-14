@@ -21,12 +21,27 @@ function App() {
   const gameId = "g/" + params.owner + "/" + params.repo
   const levelId = parseInt(params.levelId)
   const worldId = params.worldId
+  const lastLevelRef = React.useRef<string | null>(null)
 
   const {mobile, layout, isSavePreferences, language, isSuggestionsMobileMode, setLayout, setIsSavePreferences, setLanguage, setIsSuggestionsMobileMode} = UsePreferences()
 
   React.useEffect(() => {
     i18n.changeLanguage(language)
   }, [language])
+
+  React.useEffect(() => {
+    if (!gameId || !worldId || !Number.isFinite(levelId)) {
+      return
+    }
+    const levelKey = `${gameId}:${worldId}:${levelId}`
+    if (lastLevelRef.current === null) {
+      lastLevelRef.current = levelKey
+      return
+    }
+    if (lastLevelRef.current !== levelKey) {
+      lastLevelRef.current = levelKey
+    }
+  }, [gameId, worldId, levelId])
 
   return (
     <div className="app">

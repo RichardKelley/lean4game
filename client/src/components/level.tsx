@@ -38,7 +38,7 @@ import '@fontsource/roboto/700.css'
 import '../css/level.css'
 import { LevelAppBar } from './app_bar'
 import { WebSocketMessageWriter, toSocket } from 'vscode-ws-jsonrpc'
-import { isLastStepWithErrors, lastStepHasErrors } from './infoview/goals'
+import { isLastStepWithErrors, lastStepHasErrors, parseWorldLevelUri } from './infoview/goals'
 import { useTranslation } from 'react-i18next'
 import i18next from 'i18next'
 import { useGameTranslation } from '../utils/translation'
@@ -236,8 +236,12 @@ function PlayableLevel() {
 
   const dispatch = useAppDispatch()
 
+  const [leanMonacoEditor, setLeanMonacoEditor] = useState<LeanMonacoEditor|null>(null)
+  const [editorConnection, setEditorConnection] = useState<null|EditorConnection>(null)
   const initialCode = useAppSelector(selectCode(gameId, worldId, levelId))
   const initialSelections = useAppSelector(selectSelections(gameId, worldId, levelId))
+  const levelKey = `${gameId}:${worldId}:${levelId}`
+  const seededLevelRef = useRef<string | null>(null)
 
   const typewriterMode = useSelector(selectTypewriterMode(gameId))
   const setTypewriterMode = (newTypewriterMode: boolean) => dispatch(changeTypewriterMode({game: gameId, typewriterMode: newTypewriterMode}))
@@ -249,6 +253,20 @@ function PlayableLevel() {
   const [proof, setProof] = useState<ProofState>({steps: [], diagnostics: [], completed: false, completedWithWarnings: false})
   const [interimDiags, setInterimDiags] = useState<Array<Diagnostic>>([])
   const [isCrashed, setIsCrashed] = useState<Boolean>(false)
+  const levelKeyRef = useRef(`${worldId}:${levelId}`)
+  levelKeyRef.current = `${worldId}:${levelId}`
+  const guardedSetProof = React.useCallback<React.Dispatch<React.SetStateAction<ProofState>>>((value) => {
+    if (levelKeyRef.current !== `${worldId}:${levelId}`) {
+      return
+    }
+    setProof(value)
+  }, [worldId, levelId])
+  const guardedSetCrashed = React.useCallback<React.Dispatch<React.SetStateAction<Boolean>>>((value) => {
+    if (levelKeyRef.current !== `${worldId}:${levelId}`) {
+      return
+    }
+    setIsCrashed(value)
+  }, [worldId, levelId])
 
 
   // When deleting the proof, we want to keep to old messages around until
@@ -270,8 +288,11 @@ function PlayableLevel() {
   const [inventoryDoc, setInventoryDoc] = useState<{name: string, type: string}>(null)
   function closeInventoryDoc () {setInventoryDoc(null)}
 
-  const [leanMonacoEditor, setLeanMonacoEditor] = useState<LeanMonacoEditor|null>(null)
-  const [editorConnection, setEditorConnection] = useState<null|EditorConnection>(null)
+  useEffect(() => {
+    setEditorConnection(null)
+    setLeanMonacoEditor(null)
+  }, [worldId, levelId])
+
 
   const socketUrl = ((window.location.protocol === "https:") ? "wss://" : "ws://") + window.location.host + '/websocket/' + gameId
 
@@ -286,15 +307,46 @@ function PlayableLevel() {
     }
   })
 
+  const resolveWorldLevel = React.useCallback(() => {
+    const uri = leanMonacoEditor?.editor?.getModel()?.uri.toString() ?? ''
+    const parsed = parseWorldLevelUri(uri)
+    const normalizedWorldId = (() => {
+      if (!worldId) {
+        return worldId
+      }
+      try {
+        return decodeURIComponent(worldId)
+      } catch {
+        return worldId
+      }
+    })()
+    if (parsed) {
+      const worldMatches = !normalizedWorldId || parsed.worldId === normalizedWorldId
+      const levelMatches = !Number.isFinite(levelId) || parsed.levelId === levelId
+      if (worldMatches && levelMatches) {
+        return parsed
+      }
+    }
+    return { worldId: normalizedWorldId ?? worldId, levelId }
+  }, [leanMonacoEditor?.editor, worldId, levelId])
+
   const onDidChangeContent = (code) => {
-    dispatch(codeEdited({game: gameId, world: worldId, level: levelId, code}))
+    const resolved = resolveWorldLevel()
+    if (!resolved.worldId || !Number.isFinite(resolved.levelId)) {
+      return
+    }
+    dispatch(codeEdited({game: gameId, world: resolved.worldId, level: resolved.levelId, code}))
   }
 
   const onDidChangeSelection = (monacoSelections) => {
     const selections = monacoSelections.map(
       ({selectionStartLineNumber, selectionStartColumn, positionLineNumber, positionColumn}) =>
       {return {selectionStartLineNumber, selectionStartColumn, positionLineNumber, positionColumn}})
-    dispatch(changedSelection({game: gameId, world: worldId, level: levelId, selections}))
+    const resolved = resolveWorldLevel()
+    if (!resolved.worldId || !Number.isFinite(resolved.levelId)) {
+      return
+    }
+    dispatch(changedSelection({game: gameId, world: resolved.worldId, level: resolved.levelId, selections}))
   }
 
 
@@ -433,7 +485,52 @@ function PlayableLevel() {
       disposed = true
       leanMonacoEditor.dispose()
     }
-  }, [options, infoviewRef, codeviewRef, initialCode, worldId, levelId])
+  }, [options, infoviewRef, codeviewRef, worldId, levelId])
+
+  useEffect(() => {
+    const editor = leanMonacoEditor?.editor
+    if (!editor) {
+      return
+    }
+    const model = editor.getModel()
+    if (!model) {
+      return
+    }
+    const currentValue = model.getValue()
+    const hasContent = Boolean(currentValue.trim())
+    const nextCode = initialCode ?? ''
+    if (!nextCode) {
+      if (hasContent) {
+        editor.setValue('')
+      }
+      seededLevelRef.current = levelKey
+      return
+    }
+    if (seededLevelRef.current === levelKey && hasContent) {
+      return
+    }
+    if (!hasContent) {
+      editor.setValue(nextCode)
+    }
+    seededLevelRef.current = levelKey
+  }, [leanMonacoEditor?.editor, initialCode, levelKey])
+
+  useEffect(() => {
+    const editor = leanMonacoEditor?.editor
+    if (!editor) {
+      return
+    }
+    const disposable = editor.onDidChangeModelContent(() => {
+      const resolved = resolveWorldLevel()
+      if (!resolved.worldId || !Number.isFinite(resolved.levelId)) {
+        return
+      }
+      dispatch(codeEdited({game: gameId, world: resolved.worldId, level: resolved.levelId, code: editor.getValue()}))
+    })
+    return () => {
+      disposable.dispose()
+    }
+  }, [leanMonacoEditor?.editor, dispatch, gameId, worldId, levelId])
 
   /** Unused. Was implementing an undo button, which has been replaced by `deleteProof` inside
    * `TypewriterInterface`.
@@ -464,6 +561,73 @@ function PlayableLevel() {
   // TODO: with the new design, there is no difference between the introduction and
   // a hint at the beginning of the proof...
   const [selectedStep, setSelectedStep] = useState<number>()
+
+  useEffect(() => {
+    if (!editorConnection || !leanMonacoEditor?.editor) {
+      return
+    }
+    const editor = leanMonacoEditor.editor
+    const fireCursorLocation = () => {
+      const model = editor.getModel()
+      if (!model) {
+        return
+      }
+      const selection = editor.getSelection()
+      const position = editor.getPosition()
+      if (!selection) {
+        if (!position) {
+          return
+        }
+        const loc: Location = {
+          uri: model.uri.toString(),
+          range: {
+            start: {
+              line: position.lineNumber - 1,
+              character: position.column - 1,
+            },
+            end: {
+              line: position.lineNumber - 1,
+              character: position.column - 1,
+            },
+          },
+        }
+        editorConnection.events.changedCursorLocation.fire(loc)
+        return
+      }
+      const loc: Location = {
+        uri: model.uri.toString(),
+        range: {
+          start: {
+            line: selection.startLineNumber - 1,
+            character: selection.startColumn - 1,
+          },
+          end: {
+            line: selection.endLineNumber - 1,
+            character: selection.endColumn - 1,
+          },
+        },
+      }
+      editorConnection.events.changedCursorLocation.fire(loc)
+    }
+
+    editorConnection.events.changedCursorLocation.fire(undefined)
+    const timer = window.setTimeout(() => fireCursorLocation(), 0)
+    const followup = window.setTimeout(() => fireCursorLocation(), 100)
+    return () => {
+      window.clearTimeout(timer)
+      window.clearTimeout(followup)
+    }
+  }, [editorConnection, leanMonacoEditor?.editor, worldId, levelId])
+
+  useEffect(() => {
+    setProof({steps: [], diagnostics: [], completed: false, completedWithWarnings: false})
+    setInterimDiags([])
+    setIsCrashed(false)
+    setDeletedChat([])
+    setShowHelp(new Set())
+    setSelectedStep(undefined)
+    setTypewriterInput("")
+  }, [worldId, levelId])
 
 
   useEffect (() => {
@@ -510,6 +674,15 @@ function PlayableLevel() {
     // Load the selected help steps from the store
     setShowHelp(new Set(selectHelp(gameId, worldId, levelId)(store.getState())))
   }, [gameId, worldId, levelId])
+
+  useEffect(() => {
+    const editor = leanMonacoEditor?.editor
+    if (!editor) {
+      return
+    }
+    const readOnly = typewriterMode && !lockEditorMode
+    editor.updateOptions({ readOnly, domReadOnly: readOnly })
+  }, [leanMonacoEditor?.editor, typewriterMode, lockEditorMode])
 
   useEffect(() => {
     if (!(typewriterMode && !lockEditorMode) && leanMonacoEditor?.editor) {
@@ -566,13 +739,15 @@ function PlayableLevel() {
     }
   }, [leanMonacoEditor, leanMonacoEditor?.editor, typewriterMode, lockEditorMode])
 
+  const viewKey = `${gameId}:${worldId}:${levelId}`
+
   return <>
     <div style={level.isLoading ? null : {display: "none"}} className="app-content loading"><CircularProgress /></div>
     <DeletedChatContext.Provider value={{deletedChat, setDeletedChat, showHelp, setShowHelp}}>
       <SelectionContext.Provider value={{selectedStep, setSelectedStep}}>
         <InputModeContext.Provider value={{typewriterMode, setTypewriterMode, typewriterInput, setTypewriterInput, lockEditorMode, setLockEditorMode}}>
-          <ProofContext.Provider value={{proof, setProof, interimDiags, setInterimDiags, crashed: isCrashed, setCrashed: setIsCrashed}}>
-            <EditorContext.Provider value={editorConnection}>
+          <ProofContext.Provider value={{proof, setProof: guardedSetProof, interimDiags, setInterimDiags, crashed: isCrashed, setCrashed: guardedSetCrashed}}>
+            <EditorContext.Provider value={editorConnection} key={viewKey}>
               <MonacoEditorContext.Provider value={leanMonacoEditor?.editor}>
                 <LevelAppBar
                   pageNumber={pageNumber} setPageNumber={setPageNumber}

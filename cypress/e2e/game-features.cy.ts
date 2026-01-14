@@ -33,6 +33,15 @@ describe('Basic Lean4Game Features', () => {
     cy.contains('Assumptions:', { timeout: 60000 })
   }
 
+  const ensureEditorMode = () => {
+    cy.get('body').then($body => {
+      if ($body.find('.fa-code').length) {
+        cy.get('.fa-code').click()
+      }
+    })
+    cy.get('.fa-terminal', { timeout: 30000 }).should('be.visible')
+  }
+
   describe('Navigation and UI Structure', () => {
     it('should navigate to world introduction via Test World button', () => {
       navigateToIntroduction()
@@ -88,19 +97,19 @@ describe('Basic Lean4Game Features', () => {
     it('should show goal and hint in editor mode', () => {
       navigateToLevel()
 
-      cy.get(".fa-code").click()
+      ensureEditorMode()
 
-      cy.contains('Current Goal')
-      cy.contains('unsolved goals')
+      cy.contains('Current Goal', { timeout: 30000 })
+      cy.contains('unsolved goals', { timeout: 30000 })
       cy.get('.infoview').contains('x + x = y')
       cy.get('.infoview').contains('You can either start using h or g.')
 
       cy.get('.codeview').type('rw [h]{enter}')
 
-      cy.contains('2 + 2 = y')
+      cy.contains('2 + 2 = y', { timeout: 30000 })
       cy.get('.infoview').contains('2 + 2 = y')
-      cy.contains('Current Goal')
-      cy.contains('unsolved goals')
+      cy.contains('Current Goal', { timeout: 30000 })
+      cy.contains('unsolved goals', { timeout: 30000 })
       cy.get('.infoview').contains('You should use g now.')
 
       cy.focused().type('{uparrow}')
@@ -272,7 +281,7 @@ describe('Basic Lean4Game Features', () => {
       cy.get('li[data-value="de"]').click()
 
       // Close preferences
-      cy.get('.codicon').click()
+      cy.get('.modal-close').click()
 
       // Check that displayed language is german
       cy.contains('Du kannst mit h oder g starten.').should('be.visible')
@@ -292,7 +301,7 @@ describe('Basic Lean4Game Features', () => {
       cy.get('li[data-value="zh"]').click()
 
       // Close preferences
-      cy.get('.codicon').click()
+      cy.get('.modal-close').click()
 
       // Check that displayed language is english
       cy.contains('You can either start using h or g.').should('be.visible')

@@ -205,6 +205,17 @@ export class GameManager {
         message.params.rootUri = gameData.name
       }
 
+      if (message.method === "textDocument/didClose") {
+        if (isDevelopment) {
+          console.log(`CLIENT: ignoring didClose for ${message.params?.textDocument?.uri}`)
+        }
+        return {
+          jsonrpc: message.jsonrpc ?? "2.0",
+          method: "$/noop",
+          params: {}
+        }
+      }
+
       if (message.method === "textDocument/semanticTokens/full") {
         semanticTokenRequestIds.add(message.id)
       }

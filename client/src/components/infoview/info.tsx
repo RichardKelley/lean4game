@@ -14,10 +14,9 @@ import { GoalsLocation, Locations, LocationsContext } from '../../../../node_mod
 
 import { AllMessages, lspDiagToInteractive } from './messages'
 import { InputModeContext } from './context'
-import { goalsToString } from './goals'
-import { goalsToString, Goal, MainAssumptions, OtherGoals } from './goals'
+import { goalsToString, Goal, MainAssumptions, OtherGoals, normalizeProofState, parseWorldLevelUri } from './goals'
 import { InteractiveTermGoal, InteractiveGoalsWithHints, InteractiveGoals, ProofState } from './rpc_api'
-import { MonacoEditorContext, ProofStateProps, InfoStatus, ProofContext, WorldLevelIdContext } from './context'
+import { MonacoEditorContext, ProofStateProps, InfoStatus, ProofContext } from './context'
 import { useTranslation } from 'react-i18next'
 import { useContext } from 'react'
 
@@ -28,6 +27,28 @@ interface InfoPinnable {
     kind: InfoKind
     /** Takes an argument for caching reasons, but should only ever (un)pin itself. */
     onPin: (pos: DocumentPosition) => void
+}
+
+const isClosedFileError = (error: unknown): boolean => {
+    if (typeof error === 'string') {
+        return error.includes('closed file') || error.includes('file closed')
+    }
+    if (error && typeof error === 'object' && 'message' in error) {
+        const message = (error as { message?: string }).message
+        return typeof message === 'string' && (message.includes('closed file') || message.includes('file closed'))
+    }
+    return false
+}
+
+const isNoConnectionError = (error: unknown): boolean => {
+    if (typeof error === 'string') {
+        return error.includes('No connection to Lean')
+    }
+    if (error && typeof error === 'object' && 'message' in error) {
+        const message = (error as { message?: string }).message
+        return typeof message === 'string' && message.includes('No connection to Lean')
+    }
+    return false
 }
 
 interface InfoStatusBarProps extends InfoPinnable, PausableProps {
@@ -250,9 +271,11 @@ export function Info(props: InfoProps) {
 
 function InfoAtCursor(props: InfoProps) {
     const ec = React.useContext(EditorContext)
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-    const [curLoc, setCurLoc] = React.useState<Location>(ec.events.changedCursorLocation.current!)
-    useEvent(ec.events.changedCursorLocation, loc => loc && setCurLoc(loc), [])
+    const [curLoc, setCurLoc] = React.useState<Location | undefined>(ec.events.changedCursorLocation.current)
+    useEvent(ec.events.changedCursorLocation, loc => setCurLoc(loc), [])
+    if (!curLoc) {
+        return null
+    }
     const start = curLoc.range.start ?? { line: 0, character: 0 }
     const pos = {
       uri: curLoc.uri,
@@ -274,11 +297,16 @@ function InfoAux(props: InfoProps) {
     const { setProof } = React.useContext(ProofContext)
 
     const config = React.useContext(ConfigContext)
-
-    const {worldId, levelId} = useContext(WorldLevelIdContext)
+    const editor = React.useContext(MonacoEditorContext)
 
     // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     const pos = props.pos!
+    const model = editor?.getModel()
+    const modelUri = model?.uri.toString()
+    const isCurrentDoc = Boolean(model && !model.isDisposed() && modelUri && pos?.uri === modelUri)
+    const parsedWorldLevel = parseWorldLevelUri(pos?.uri ?? '')
+    const isMetadataDoc = Boolean(pos?.uri?.includes('/Game/Metadata.lean'))
+    const isExpectedLevelDoc = Boolean(parsedWorldLevel) && !isMetadataDoc
     const rpcSess = useRpcSessionAtPos(pos)
 
     // Compute the LSP diagnostics at this info's position. We try to ensure that if these remain
@@ -311,11 +339,34 @@ function InfoAux(props: InfoProps) {
     // with e.g. a new `pos`.
     type InfoRequestResult = Omit<InfoDisplayProps, 'triggerUpdate'>
     const [state, triggerUpdateCore] = useAsyncWithTrigger(() => new Promise<InfoRequestResult>((resolve, reject) => {
+        if (!isCurrentDoc || !isExpectedLevelDoc || serverIsProcessing) {
+            resolve({
+                pos,
+                status: 'updating',
+                messages: [],
+                proof: undefined,
+                goals: undefined,
+                termGoal: undefined,
+                error: undefined,
+                userWidgets: [],
+                rpcSess
+            })
+            return
+        }
 
+        console.info('sending rpc request to load the proof state (editor mode)', {
+            uri: pos?.uri,
+            worldId: parsedWorldLevel?.worldId,
+            levelId: parsedWorldLevel?.levelId,
+        })
         const proofReq = rpcSess.call('Game.getProofState', {
             ...DocumentPosition.toTdpp(pos),
-            worldId, levelId
+            worldId: parsedWorldLevel?.worldId,
+            levelId: parsedWorldLevel?.levelId
         }).catch((error) => {
+            if (isClosedFileError(error) || isNoConnectionError(error)) {
+                throw error
+            }
             console.warn(error)
         })
         const goalsReq = rpcSess.call('Game.getInteractiveGoals', DocumentPosition.toTdpp(pos))
@@ -360,13 +411,14 @@ function InfoAux(props: InfoProps) {
                 rpcSess
             }),
             ex => {
-                if (ex?.code === RpcErrorCode.ContentModified ||
-                    ex?.code === RpcErrorCode.RpcNeedsReconnect) {
-                    // Document has been changed since we made the request, or we need to reconnect
-                    // to the RPC sessions. Try again.
-                    setUpdaterTick(t => t + 1)
-                    reject('retry')
-                }
+            if (isClosedFileError(ex) || isNoConnectionError(ex) ||
+                ex?.code === RpcErrorCode.ContentModified ||
+                ex?.code === RpcErrorCode.RpcNeedsReconnect) {
+                // Document has been changed since we made the request, or we need to reconnect
+                // to the RPC sessions. Try again.
+                setUpdaterTick(t => t + 1)
+                reject('retry')
+            }
 
                 let errorString = ''
                 if (typeof ex === 'string') {
@@ -392,7 +444,7 @@ function InfoAux(props: InfoProps) {
                 })
             }
         )
-    }), [updaterTick, pos.uri, pos.line, pos.character, rpcSess, serverIsProcessing, lspDiagsHere])
+    }), [updaterTick, pos.uri, pos.line, pos.character, rpcSess, serverIsProcessing, lspDiagsHere, isCurrentDoc, isExpectedLevelDoc])
 
     // We use a timeout to debounce info requests. Whenever a request is already scheduled
     // but something happens that warrants a request for newer info, we cancel the old request
@@ -434,6 +486,9 @@ function InfoAux(props: InfoProps) {
     // This effect triggers new requests for info whenever need. It also propagates changes
     // in the state of the `useAsyncWithTrigger` to the displayed props.
     React.useEffect(() => {
+        if (!isCurrentDoc || !isExpectedLevelDoc) {
+            return
+        }
         if (state.state === 'notStarted')
             void triggerUpdate()
         else if (state.state === 'loading') {
@@ -446,14 +501,20 @@ function InfoAux(props: InfoProps) {
           setDisplayProps({ ...state.value, triggerUpdate })
 
           // Update the game's proof state
-          console.info('updating proof from editor mode.')
-          setProof(state.value.proof)
+          console.info('received proof state (editor mode)', state.value.proof)
+          if (state.value.proof) {
+            setProof(normalizeProofState(state.value.proof))
+          }
 
         } else if (state.state === 'rejected' && state.error !== 'retry') {
             // The code inside `useAsyncWithTrigger` may only ever reject with a `retry` exception.
             console.warn('Unreachable code reached with error: ', state.error)
         }
-    }, [state])
+    }, [state, isCurrentDoc, triggerUpdate])
+
+    if (!isCurrentDoc || !isExpectedLevelDoc) {
+        return null
+    }
 
     return <InfoDisplay kind={props.kind} onPin={props.onPin} {...displayProps} />
 }

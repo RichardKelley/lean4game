@@ -9,8 +9,9 @@ import { InteractiveDiagnostic, RpcSessionAtPos, getInteractiveDiagnostics } fro
 import { Diagnostic } from 'vscode-languageserver-types';
 import { DocumentPosition } from '../../../../node_modules/vscode-lean4/lean4-infoview/src/infoview/util';
 import { RpcContext } from '../../../../node_modules/vscode-lean4/lean4-infoview/src/infoview/rpcSessions';
+import { ProgressContext } from '../../../../node_modules/vscode-lean4/lean4-infoview/src/infoview/contexts';
 import { DeletedChatContext, InputModeContext, MonacoEditorContext, PreferencesContext, ProofContext, WorldLevelIdContext } from './context'
-import { goalsToString, lastStepHasErrors, loadGoals } from './goals'
+import { goalsToString, lastStepHasErrors, loadGoals, parseWorldLevelUri } from './goals'
 import { GameHint, ProofState } from './rpc_api'
 import { useTranslation } from 'react-i18next'
 
@@ -30,10 +31,39 @@ export function Typewriter({disabled}: {disabled?: boolean}) {
   const hasEditor = Boolean(editor && model)
 
   const {worldId, levelId} = useContext(WorldLevelIdContext)
+  const parsedWorldLevel = parseWorldLevelUri(uri)
+  const normalizedWorldId = (() => {
+    if (!worldId) {
+      return worldId
+    }
+    try {
+      return decodeURIComponent(worldId)
+    } catch {
+      return worldId
+    }
+  })()
+  const isExpectedUri = Boolean(parsedWorldLevel) && (
+    !normalizedWorldId ||
+    !Number.isFinite(levelId) ||
+    (parsedWorldLevel.worldId === normalizedWorldId && parsedWorldLevel.levelId === levelId)
+  )
+  const loadKeyRef = useRef('')
+  loadKeyRef.current = `${worldId}:${levelId}:${uri}`
+  const makeLoadGoalsOptions = React.useCallback(() => {
+    const requestKey = loadKeyRef.current
+    return { shouldApply: () => loadKeyRef.current === requestKey }
+  }, [])
 
   const [oneLineEditor, setOneLineEditor] = useState<monaco.editor.IStandaloneCodeEditor>(null)
   const oneLineEditorRef = useRef<monaco.editor.IStandaloneCodeEditor>(null)
   const [processing, setProcessing] = useState(false)
+  const pendingLoadRef = useRef(false)
+  const pendingStartedAtRef = useRef<number | null>(null)
+  const maxPendingDurationMs = 25000
+  const retryTimerRef = useRef<number | null>(null)
+  const retryDelayRef = useRef(250)
+  const retryInFlightRef = useRef(false)
+  const attemptPendingLoadRef = useRef<() => void>(() => {})
 
   const {typewriterInput, setTypewriterInput} = React.useContext(InputModeContext)
 
@@ -46,32 +76,138 @@ export function Typewriter({disabled}: {disabled?: boolean}) {
   const {setDeletedChat} = React.useContext(DeletedChatContext)
 
   const rpcSess = React.useContext(RpcContext)
+  const allProgress = React.useContext(ProgressContext)
+  const fileProgress = allProgress.get(uri)
+  const serverIsProcessing = Boolean(fileProgress && fileProgress.length > 0)
+
+  const canSubmit = hasEditor && isExpectedUri && !processing && !disabled && !serverIsProcessing
+
+  useEffect(() => {
+    pendingLoadRef.current = false
+    pendingStartedAtRef.current = null
+    retryInFlightRef.current = false
+    retryDelayRef.current = 250
+    if (retryTimerRef.current) {
+      window.clearTimeout(retryTimerRef.current)
+      retryTimerRef.current = null
+    }
+  }, [uri, worldId, levelId])
+
+  const schedulePendingLoadRetry = React.useCallback((delayOverrideMs?: number) => {
+    if (!pendingLoadRef.current || retryTimerRef.current) {
+      return
+    }
+    const delay = Number.isFinite(delayOverrideMs) && delayOverrideMs > 0
+      ? Math.max(delayOverrideMs, retryDelayRef.current)
+      : retryDelayRef.current
+    retryTimerRef.current = window.setTimeout(() => {
+      retryTimerRef.current = null
+      attemptPendingLoadRef.current()
+    }, delay)
+    retryDelayRef.current = Math.min(delay * 2, 2000)
+  }, [])
+
+  const attemptPendingLoad = React.useCallback(() => {
+    if (!pendingLoadRef.current || retryInFlightRef.current) {
+      return
+    }
+    if (!hasEditor || !isExpectedUri || !rpcSess) {
+      schedulePendingLoadRetry()
+      return
+    }
+    if (!model || model.isDisposed()) {
+      schedulePendingLoadRetry()
+      return
+    }
+    if (serverIsProcessing) {
+      schedulePendingLoadRetry()
+      return
+    }
+    retryInFlightRef.current = true
+    loadGoals(rpcSess, uri, worldId, levelId, setProof, setCrashed, makeLoadGoalsOptions()).then((result) => {
+      if (result === 'cooldown') {
+        setProcessing(false)
+        schedulePendingLoadRetry()
+        return
+      }
+      if (result !== 'loaded') {
+        setProcessing(false)
+        schedulePendingLoadRetry()
+        return
+      }
+      setProcessing(false)
+      retryDelayRef.current = 250
+      if (retryTimerRef.current) {
+        window.clearTimeout(retryTimerRef.current)
+        retryTimerRef.current = null
+      }
+    }).finally(() => {
+      retryInFlightRef.current = false
+    })
+  }, [hasEditor, isExpectedUri, rpcSess, model, uri, worldId, levelId, serverIsProcessing, setProof, setCrashed, schedulePendingLoadRetry, makeLoadGoalsOptions])
+
+  useEffect(() => {
+    attemptPendingLoadRef.current = attemptPendingLoad
+  }, [attemptPendingLoad])
+
+  useEffect(() => {
+    if (pendingLoadRef.current) {
+      attemptPendingLoad()
+    }
+  }, [attemptPendingLoad, hasEditor, isExpectedUri, rpcSess])
+
+  useEffect(() => {
+    return () => {
+      if (retryTimerRef.current) {
+        window.clearTimeout(retryTimerRef.current)
+      }
+    }
+  }, [])
+
+  const withWritableEditor = React.useCallback((fn: () => void) => {
+    if (!editor) {
+      return
+    }
+    const wasReadOnly = editor.getOption(monaco.editor.EditorOption.readOnly)
+    const wasDomReadOnly = editor.getOption(monaco.editor.EditorOption.domReadOnly)
+    if (wasReadOnly || wasDomReadOnly) {
+      editor.updateOptions({ readOnly: false, domReadOnly: false })
+    }
+    try {
+      fn()
+    } finally {
+      if (wasReadOnly || wasDomReadOnly) {
+        editor.updateOptions({ readOnly: wasReadOnly, domReadOnly: wasDomReadOnly })
+      }
+    }
+  }, [editor])
 
   // Run the command
   const runCommand = React.useCallback(() => {
-    if (processing || !hasEditor) {return}
+    if (processing || !hasEditor || disabled) {return}
+    if (!isExpectedUri) {return}
+    if (serverIsProcessing) {return}
 
     // TODO: Desired logic is to only reset this after a new *error-free* command has been entered
     setDeletedChat([])
 
-    const pos = editor.getPosition()
     if (typewriterInput) {
       setProcessing(true)
-      editor.executeEdits("typewriter", [{
-        range: monaco.Selection.fromPositions(
-          pos,
-          editor.getModel().getFullModelRange().getEndPosition()
-        ),
-        text: typewriterInput.trim() + "\n",
-        forceMoveMarkers: false
-      }])
+      pendingLoadRef.current = true
+      pendingStartedAtRef.current = Date.now()
+      withWritableEditor(() => {
+        const endPos = editor.getModel().getFullModelRange().getEndPosition()
+        editor.executeEdits("typewriter", [{
+          range: monaco.Selection.fromPositions(endPos, endPos),
+          text: typewriterInput.trim() + "\n",
+          forceMoveMarkers: false
+        }])
+        editor.setPosition(endPos)
+      })
       setTypewriterInput('')
-      // Load proof after executing edits
-      loadGoals(rpcSess, uri, worldId, levelId, setProof, setCrashed)
+      attemptPendingLoad()
     }
-
-    editor.setPosition(pos)
-  }, [typewriterInput, editor])
+  }, [processing, hasEditor, disabled, isExpectedUri, serverIsProcessing, typewriterInput, editor, withWritableEditor, rpcSess, uri, worldId, levelId, proof, setProof, setCrashed, setDeletedChat, setTypewriterInput])
 
   const {isSuggestionsMobileMode} = React.useContext(PreferencesContext)
 
@@ -99,17 +235,22 @@ export function Typewriter({disabled}: {disabled?: boolean}) {
 
   // React when answer from the server comes back
   useServerNotificationEffect('textDocument/publishDiagnostics', (params: PublishDiagnosticsParams) => {
-    if (!hasEditor) {
+    if (!hasEditor || !model || model.isDisposed()) {
+      return
+    }
+    if (!isExpectedUri) {
       return
     }
     if (params.uri == uri) {
+      if (pendingLoadRef.current) {
+        attemptPendingLoad()
+      }
       setProcessing(false)
 
       const seriousDiags = params.diagnostics.filter(diag =>
         diag.severity === DiagnosticSeverity.Error || diag.severity === DiagnosticSeverity.Warning
       )
       setInterimDiags(seriousDiags)
-      // loadGoals(rpcSess, uri, worldId, levelId, setProof, setCrashed)
 
       // TODO: loadAllGoals()
       if (!hasErrors(params.diagnostics)) {
@@ -123,7 +264,28 @@ export function Typewriter({disabled}: {disabled?: boolean}) {
     // TODO: This is the wrong place apparently. Where do wee need to load them?
     // TODO: instead of loading all goals every time, we could only load the last one
     // loadAllGoals()
-  }, [uri, hasEditor, editor]);
+  }, [uri, hasEditor, model, isExpectedUri, rpcSess, worldId, levelId, setProof, setCrashed, setInterimDiags]);
+
+  useEffect(() => {
+    if (!pendingLoadRef.current) {
+      return
+    }
+    const pendingAgeMs = pendingStartedAtRef.current ? Date.now() - pendingStartedAtRef.current : 0
+    if (proof?.completed ||
+      proof?.completedWithWarnings ||
+      lastStepHasErrors(proof) ||
+      pendingAgeMs > maxPendingDurationMs) {
+      pendingLoadRef.current = false
+      pendingStartedAtRef.current = null
+      retryDelayRef.current = 250
+      if (retryTimerRef.current) {
+        window.clearTimeout(retryTimerRef.current)
+        retryTimerRef.current = null
+      }
+      return
+    }
+    schedulePendingLoadRetry()
+  }, [proof, schedulePendingLoadRetry])
 
   // // React when answer from the server comes back
   // useServerNotificationEffect('$/game/publishDiagnostics', (params: GameDiagnosticsParams) => {
@@ -259,7 +421,7 @@ export function Typewriter({disabled}: {disabled?: boolean}) {
         <div className="typewriter-input-wrapper">
           <div ref={inputRef} className="typewriter-input" />
         </div>
-        <button type="submit" disabled={processing} className="btn btn-inverted">
+        <button type="submit" disabled={!canSubmit} className="btn btn-inverted">
           <FontAwesomeIcon icon={faWandMagicSparkles} />&nbsp;{t("Execute")}
         </button>
       </form>

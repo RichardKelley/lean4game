@@ -10,9 +10,9 @@ import '../../css/infoview.css'
 import "../../css/tab_bar.css"
 
 import { LeanFileProgressParams, LeanFileProgressProcessingInfo, defaultInfoviewConfig, EditorApi, InfoviewApi } from '@leanprover/infoview-api';
-import { useClientNotificationEffect, useEventResult, useServerNotificationEffect, useServerNotificationState } from '../../../../node_modules/vscode-lean4/lean4-infoview/src/infoview/util';
+import { useClientNotificationEffect, useEvent, useEventResult, useServerNotificationEffect, useServerNotificationState } from '../../../../node_modules/vscode-lean4/lean4-infoview/src/infoview/util';
 import { EditorContext, ConfigContext, ProgressContext, VersionContext } from '../../../../node_modules/vscode-lean4/lean4-infoview/src/infoview/contexts';
-import { RpcContext, WithRpcSessions, useRpcSessionAtPos } from '../../../../node_modules/vscode-lean4/lean4-infoview/src/infoview/rpcSessions';
+import { RpcContext, RpcSessionAtPos, WithRpcSessions, useRpcSessionAtPos } from '../../../../node_modules/vscode-lean4/lean4-infoview/src/infoview/rpcSessions';
 import { ServerVersion } from '../../../../node_modules/vscode-lean4/lean4-infoview/src/infoview/serverVersion';
 
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome'
@@ -27,7 +27,7 @@ import { Markdown } from '../markdown';
 
 import { Infos } from './infos';
 import { AllMessages, Errors, WithLspDiagnosticsContext } from './messages';
-import { Goal, isLastStepWithErrors, lastStepHasErrors, loadGoals } from './goals';
+import { Goal, isLastStepWithErrors, lastStepHasErrors, loadGoals, parseWorldLevelUri } from './goals';
 import { DeletedChatContext, InputModeContext, PreferencesContext, MonacoEditorContext, ProofContext, SelectionContext, WorldLevelIdContext } from './context';
 import { Typewriter, getInteractiveDiagsAt, hasErrors, hasInteractiveErrors } from './typewriter';
 import { InteractiveDiagnostic } from '@leanprover/infoview/*';
@@ -176,14 +176,50 @@ export function Main(props: { world: string, level: number, data: LevelInfo}) {
   const editor = React.useContext(MonacoEditorContext)
   const model = editor?.getModel()
   const uri = model?.uri.toString()
+  const allProgress = React.useContext(ProgressContext)
+  const fileProgress = allProgress.get(uri ?? '')
+  const serverIsProcessing = Boolean(fileProgress && fileProgress.length > 0)
+  const parsedWorldLevel = parseWorldLevelUri(uri ?? '')
+  const normalizedWorldId = (() => {
+    if (!worldId) {
+      return worldId
+    }
+    try {
+      return decodeURIComponent(worldId)
+    } catch {
+      return worldId
+    }
+  })()
+  const isExpectedUri = Boolean(parsedWorldLevel) && (
+    !normalizedWorldId ||
+    !Number.isFinite(levelId) ||
+    (parsedWorldLevel.worldId === normalizedWorldId && parsedWorldLevel.levelId === levelId)
+  )
+  const loadKeyRef = React.useRef('')
+  const initialLoadDelayRef = React.useRef(true)
+  loadKeyRef.current = `${worldId}:${levelId}:${uri ?? ''}`
+  React.useEffect(() => {
+    initialLoadDelayRef.current = true
+  }, [uri, worldId, levelId])
+  const makeLoadGoalsOptions = React.useCallback(() => {
+    const requestKey = loadKeyRef.current
+    const shouldDelay = initialLoadDelayRef.current
+    if (shouldDelay) {
+      initialLoadDelayRef.current = false
+    }
+    return {
+      shouldApply: () => loadKeyRef.current === requestKey,
+      delayMs: shouldDelay ? 500 : 0,
+    }
+  }, [])
   const rpcSess = useRpcSessionAtPos({ uri: uri ?? '', line: 0, character: 0 })
 
   React.useEffect(() => {
-    if (!uri) {
+    if (!uri || !isExpectedUri || serverIsProcessing) {
       return
     }
-    loadGoals(rpcSess, uri, worldId, levelId, setProof, setCrashed)
-  }, [rpcSess, uri, worldId, levelId, setProof, setCrashed])
+    loadGoals(rpcSess, uri, worldId, levelId, setProof, setCrashed, makeLoadGoalsOptions())
+  }, [rpcSess, uri, isExpectedUri, worldId, levelId, serverIsProcessing, setProof, setCrashed, makeLoadGoalsOptions])
 
 
   function toggleSelection(line: number) {
@@ -207,19 +243,6 @@ export function Main(props: { world: string, level: number, data: LevelInfo}) {
   //   }
   // }, [props.data.template])
 
-  /* Set up updates to the global infoview state on editor events. */
-  const config = useEventResult(ec.events.changedInfoviewConfig) ?? defaultInfoviewConfig;
-
-  const [allProgress, _1] = useServerNotificationState(
-    '$/lean/fileProgress',
-    new Map<DocumentUri, LeanFileProgressProcessingInfo[]>(),
-    async (params: LeanFileProgressParams) => (allProgress) => {
-      const newProgress = new Map(allProgress);
-      return newProgress.set(params.textDocument.uri, params.processing);
-    },
-    []
-  );
-
   const curUri = useEventResult(ec.events.changedCursorLocation, loc => loc?.uri);
 
   const curPos: DocumentPosition | undefined =
@@ -229,21 +252,21 @@ export function Main(props: { world: string, level: number, data: LevelInfo}) {
     if (typewriterMode && !lockEditorMode) {
       return
     }
-    if (!uri) {
+    if (!uri || !isExpectedUri || serverIsProcessing) {
       return
     }
-    loadGoals(rpcSess, uri, worldId, levelId, setProof, setCrashed)
-  }, [typewriterMode, lockEditorMode, uri, worldId, levelId, rpcSess, setProof, setCrashed])
+    loadGoals(rpcSess, uri, worldId, levelId, setProof, setCrashed, makeLoadGoalsOptions())
+  }, [typewriterMode, lockEditorMode, uri, isExpectedUri, worldId, levelId, serverIsProcessing, rpcSess, setProof, setCrashed, makeLoadGoalsOptions])
 
   useServerNotificationEffect('textDocument/publishDiagnostics', (params: any) => {
     if (typewriterMode && !lockEditorMode) {
       return
     }
-    if (!uri || params?.uri !== uri) {
+    if (!uri || !isExpectedUri || serverIsProcessing || params?.uri !== uri) {
       return
     }
-    loadGoals(rpcSess, uri, worldId, levelId, setProof, setCrashed)
-  }, [typewriterMode, lockEditorMode, uri, worldId, levelId, rpcSess, setProof, setCrashed])
+    loadGoals(rpcSess, uri, worldId, levelId, setProof, setCrashed, makeLoadGoalsOptions())
+  }, [typewriterMode, lockEditorMode, uri, isExpectedUri, worldId, levelId, serverIsProcessing, rpcSess, setProof, setCrashed, makeLoadGoalsOptions])
 
   const hintLine = (() => {
     const isEditorMode = !(typewriterMode && !lockEditorMode)
@@ -319,12 +342,12 @@ export function Main(props: { world: string, level: number, data: LevelInfo}) {
     ret = <div><p>{serverStoppedResult.message}</p><p className="error">{serverStoppedResult.reason}</p></div>
   } else {
     ret = <div className="infoview vscode-light">
-      {proof?.completedWithWarnings &&
+      {proof?.completed &&
         <div className="level-completed">
-          {proof?.completed ? t("Level completed! 🎉") : t("Level completed with warnings 🎭")}
+          {t("Level completed! 🎉")}
         </div>
       }
-      <Infos />
+      <Infos key={`${worldId}:${levelId}`} />
       {hintsToShow && (
         <Hints hints={hintsToShow}
           showHidden={showHelp.has(hintStepIndex)} step={hintStepIndex}
@@ -488,8 +511,39 @@ export function TypewriterInterface({props}) {
 
   const gameInfo = useGetGameInfoQuery({game: gameId})
   const {worldId, levelId} = React.useContext(WorldLevelIdContext)
-  const fallbackUri = `file:///${worldId}/${levelId}.lean`
-  const effectiveUri = uri || fallbackUri
+  const parsedWorldLevel = parseWorldLevelUri(uri)
+  const normalizedWorldId = (() => {
+    if (!worldId) {
+      return worldId
+    }
+    try {
+      return decodeURIComponent(worldId)
+    } catch {
+      return worldId
+    }
+  })()
+  const isExpectedUri = Boolean(parsedWorldLevel) && (
+    !normalizedWorldId ||
+    !Number.isFinite(levelId) ||
+    (parsedWorldLevel.worldId === normalizedWorldId && parsedWorldLevel.levelId === levelId)
+  )
+  const loadKeyRef = React.useRef('')
+  const initialLoadDelayRef = React.useRef(true)
+  loadKeyRef.current = `${worldId}:${levelId}:${uri}`
+  React.useEffect(() => {
+    initialLoadDelayRef.current = true
+  }, [uri, worldId, levelId])
+  const makeLoadGoalsOptions = React.useCallback(() => {
+    const requestKey = loadKeyRef.current
+    const shouldDelay = initialLoadDelayRef.current
+    if (shouldDelay) {
+      initialLoadDelayRef.current = false
+    }
+    return {
+      shouldApply: () => loadKeyRef.current === requestKey,
+      delayMs: shouldDelay ? 500 : 0,
+    }
+  }, [])
   let image: string = gameInfo.data?.worlds.nodes[worldId].image
 
 
@@ -500,20 +554,139 @@ export function TypewriterInterface({props}) {
   const { proof, setProof, crashed, setCrashed, interimDiags } = React.useContext(ProofContext)
   const { setTypewriterInput } = React.useContext(InputModeContext)
   const { selectedStep, setSelectedStep } = React.useContext(SelectionContext)
+  const lastLoadUriRef = React.useRef<string>('')
+  const lastLoadRpcSessRef = React.useRef<RpcSessionAtPos | null>(null)
+  const withWritableEditor = React.useCallback((fn: () => void) => {
+    if (!editor) {
+      return
+    }
+    const wasReadOnly = editor.getOption(monaco.editor.EditorOption.readOnly)
+    const wasDomReadOnly = editor.getOption(monaco.editor.EditorOption.domReadOnly)
+    if (wasReadOnly || wasDomReadOnly) {
+      editor.updateOptions({ readOnly: false, domReadOnly: false })
+    }
+    try {
+      fn()
+    } finally {
+      if (wasReadOnly || wasDomReadOnly) {
+        editor.updateOptions({ readOnly: wasReadOnly, domReadOnly: wasDomReadOnly })
+      }
+    }
+  }, [editor])
 
   const proofPanelRef = React.useRef<HTMLDivElement>(null)
+  const initialProofLoadedRef = React.useRef(false)
+  const initialLoadInFlightRef = React.useRef(false)
+  const initialLoadRetryTimerRef = React.useRef<number | null>(null)
+  const initialLoadRetryDelayRef = React.useRef(250)
+  const attemptInitialLoadRef = React.useRef<() => void>(() => {})
   // const config = useEventResult(ec.events.changedInfoviewConfig) ?? defaultInfoviewConfig;
   // const curUri = useEventResult(ec.events.changedCursorLocation, loc => loc?.uri);
 
-  const rpcSess = useRpcSessionAtPos({uri: effectiveUri, line: 0, character: 0})
+  const rpcSess = useRpcSessionAtPos({uri, line: 0, character: 0})
+  const rpcSessRef = React.useRef(rpcSess)
+  const allProgress = React.useContext(ProgressContext)
+  const fileProgress = allProgress.get(uri)
+  const serverIsProcessing = Boolean(fileProgress && fileProgress.length > 0)
 
   React.useEffect(() => {
-    if (!effectiveUri) {
+    rpcSessRef.current = rpcSess
+  }, [rpcSess])
+
+  React.useEffect(() => {
+    setCrashed(false)
+  }, [worldId, levelId, setCrashed])
+
+  React.useEffect(() => {
+    initialProofLoadedRef.current = false
+    initialLoadInFlightRef.current = false
+    if (initialLoadRetryTimerRef.current) {
+      window.clearTimeout(initialLoadRetryTimerRef.current)
+      initialLoadRetryTimerRef.current = null
+    }
+    initialLoadRetryDelayRef.current = 250
+  }, [uri, worldId, levelId])
+
+  const scheduleInitialLoadRetry = React.useCallback((delayOverrideMs?: number) => {
+    if (initialProofLoadedRef.current || initialLoadRetryTimerRef.current) {
       return
     }
-    setCrashed(false)
-    loadGoals(rpcSess, effectiveUri, worldId, levelId, setProof, setCrashed)
-  }, [rpcSess, effectiveUri, worldId, levelId, setProof, setCrashed])
+    const delay = Number.isFinite(delayOverrideMs) && delayOverrideMs > 0
+      ? Math.max(delayOverrideMs, initialLoadRetryDelayRef.current)
+      : initialLoadRetryDelayRef.current
+    initialLoadRetryTimerRef.current = window.setTimeout(() => {
+      initialLoadRetryTimerRef.current = null
+      attemptInitialLoadRef.current()
+    }, delay)
+    initialLoadRetryDelayRef.current = Math.min(delay * 2, 2000)
+  }, [])
+
+  const attemptInitialLoad = React.useCallback(() => {
+    if (initialProofLoadedRef.current || initialLoadInFlightRef.current) {
+      return
+    }
+    if (!uri || !isExpectedUri) {
+      return
+    }
+    if (!rpcSessRef.current) {
+      return
+    }
+    if (!model || model.isDisposed()) {
+      return
+    }
+    if (serverIsProcessing) {
+      scheduleInitialLoadRetry()
+      return
+    }
+    const activeRpcSess = rpcSessRef.current
+    lastLoadUriRef.current = uri
+    lastLoadRpcSessRef.current = activeRpcSess
+    initialLoadInFlightRef.current = true
+    loadGoals(activeRpcSess, uri, worldId, levelId, setProof, setCrashed, makeLoadGoalsOptions()).then((result) => {
+      if (lastLoadUriRef.current !== uri || lastLoadRpcSessRef.current !== activeRpcSess) {
+        return
+      }
+      if (result === 'loaded') {
+        initialProofLoadedRef.current = true
+        initialLoadRetryDelayRef.current = 250
+        if (initialLoadRetryTimerRef.current) {
+          window.clearTimeout(initialLoadRetryTimerRef.current)
+          initialLoadRetryTimerRef.current = null
+        }
+      } else {
+        scheduleInitialLoadRetry()
+      }
+    }).finally(() => {
+      initialLoadInFlightRef.current = false
+    })
+  }, [uri, isExpectedUri, model, worldId, levelId, serverIsProcessing, setProof, setCrashed, scheduleInitialLoadRetry, makeLoadGoalsOptions])
+
+  React.useEffect(() => {
+    attemptInitialLoadRef.current = attemptInitialLoad
+  }, [attemptInitialLoad])
+
+  React.useEffect(() => {
+    attemptInitialLoad()
+  }, [attemptInitialLoad])
+
+  useEvent(ec.events.serverRestarted, () => {
+    initialProofLoadedRef.current = false
+    initialLoadInFlightRef.current = false
+    if (initialLoadRetryTimerRef.current) {
+      window.clearTimeout(initialLoadRetryTimerRef.current)
+      initialLoadRetryTimerRef.current = null
+    }
+    initialLoadRetryDelayRef.current = 250
+    attemptInitialLoad()
+  }, [attemptInitialLoad])
+
+  React.useEffect(() => {
+    return () => {
+      if (initialLoadRetryTimerRef.current) {
+        window.clearTimeout(initialLoadRetryTimerRef.current)
+      }
+    }
+  }, [])
 
   /** Delete all proof lines starting from a given line.
   * Note that the first line (i.e. deleting everything) is `1`!
@@ -532,18 +705,20 @@ export function TypewriterInterface({props}) {
       // delete showHelp for deleted steps
       setShowHelp(new Set(Array.from(showHelp).filter(i => i < line - 1)))
 
-      editor.executeEdits("typewriter", [{
-        range: monaco.Selection.fromPositions(
-          { lineNumber: line, column: 1 },
-          editor.getModel().getFullModelRange().getEndPosition()
-        ),
-        text: '',
-        forceMoveMarkers: false
-      }])
+      withWritableEditor(() => {
+        editor.executeEdits("typewriter", [{
+          range: monaco.Selection.fromPositions(
+            { lineNumber: line, column: 1 },
+            editor.getModel().getFullModelRange().getEndPosition()
+          ),
+          text: '',
+          forceMoveMarkers: false
+        }])
+      })
       setSelectedStep(undefined)
       setTypewriterInput(proof?.steps[line].command)
       // Reload proof on deleting
-      loadGoals(rpcSess, uri, worldId, levelId, setProof, setCrashed)
+      loadGoals(rpcSess, uri, worldId, levelId, setProof, setCrashed, makeLoadGoalsOptions())
       ev.stopPropagation()
     }
   }

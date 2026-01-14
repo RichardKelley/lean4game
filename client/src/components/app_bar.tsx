@@ -261,7 +261,6 @@ export function WelcomeAppBar({pageNumber, setPageNumber, gameInfo} : {
       <UploadButton />
       <ImpressumButton isDropdown={true} />
       <PrivacyButton isDropdown={true} />
-      <EraseButton />
       <PreferencesButton />
     </div>
   </div>

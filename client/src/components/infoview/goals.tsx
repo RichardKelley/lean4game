@@ -4,7 +4,7 @@
  * Mostly copied from https://github.com/leanprover/vscode-lean4/blob/master/lean4-infoview/src/infoview/goals.tsx
  */
 import * as React from 'react'
-import { InteractiveHypothesisBundle_nonAnonymousNames, MVarId, TaggedText_stripTags } from '@leanprover/infoview-api'
+import { InteractiveHypothesisBundle_nonAnonymousNames, MVarId, RpcErrorCode, TaggedText_stripTags, isRpcError } from '@leanprover/infoview-api'
 import { EditorContext } from '../../../../node_modules/vscode-lean4/lean4-infoview/src/infoview/contexts';
 import { Locations, LocationsContext, SelectableLocation } from '../../../../node_modules/vscode-lean4/lean4-infoview/src/infoview/goalLocation';
 import { InteractiveCode } from '../../../../node_modules/vscode-lean4/lean4-infoview/src/infoview/interactiveCode'
@@ -50,8 +50,52 @@ export function goalsToString(goals: InteractiveGoals): string {
     return goals.goals.map(g => goalToString(g)).join('\n\n')
 }
 
+export function parseWorldLevelUri(uri: string): { worldId: string, levelId: number } | null {
+    if (!uri) {
+        return null
+    }
+    const match = uri.match(/^file:\/\/\/([^/]+)\/(\d+)\.lean$/)
+    if (!match) {
+        return null
+    }
+    const [, rawWorldId, rawLevelId] = match
+    let worldId = rawWorldId
+    try {
+        worldId = decodeURIComponent(rawWorldId)
+    } catch {
+        worldId = rawWorldId
+    }
+    const levelId = Number.parseInt(rawLevelId, 10)
+    if (!Number.isFinite(levelId)) {
+        return null
+    }
+    return { worldId, levelId }
+}
+
 export function goalsWithHintsToString(goals: InteractiveGoalsWithHints): string {
     return goals.goals.map(g => goalToString(g.goal)).join('\n\n')
+}
+
+export function normalizeProofState(proof: ProofState): ProofState {
+  if (!proof?.steps?.length) {
+    if (!proof) {
+      return proof
+    }
+    return { ...proof, completed: false, completedWithWarnings: false }
+  }
+  const lastStep = proof.steps[proof.steps.length - 1]
+  const hasOpenGoals = Boolean(lastStep?.goals?.length)
+  if (hasOpenGoals && (proof.completed || proof.completedWithWarnings)) {
+    return { ...proof, completed: false, completedWithWarnings: false }
+  }
+  if (!hasOpenGoals && !proof.completed) {
+    const hasErrors = Boolean(proof.diagnostics?.some((d) => d.severity === DiagnosticSeverity.Error)) ||
+      proof.steps.some((step) => step.diags?.some((d) => d.severity === DiagnosticSeverity.Error))
+    if (!hasErrors) {
+      return { ...proof, completed: true }
+    }
+  }
+  return proof
 }
 
 interface GoalFilterState {
@@ -355,39 +399,232 @@ export const FilteredGoals = React.memo(({ headerChildren, goals }: FilteredGoal
     </div>
 })
 
+const isClosedFileError = (error: unknown): boolean => {
+  if (typeof error === 'string') {
+    return error.includes('closed file') || error.includes('file closed')
+  }
+  if (error && typeof error === 'object' && 'message' in error) {
+    return typeof (error as { message?: string }).message === 'string' &&
+      ((error as { message?: string }).message?.includes('closed file') ||
+        (error as { message?: string }).message?.includes('file closed'))
+  }
+  return false
+}
+
+const isNoConnectionError = (error: unknown): boolean => {
+  if (typeof error === 'string') {
+    return error.includes('No connection to Lean')
+  }
+  if (error && typeof error === 'object' && 'message' in error) {
+    return typeof (error as { message?: string }).message === 'string' &&
+      (error as { message?: string }).message?.includes('No connection to Lean')
+  }
+  return false
+}
+
+const isRetryableRpcError = (error: unknown): boolean => {
+  if (!isRpcError(error)) {
+    return false
+  }
+  return error.code === RpcErrorCode.ContentModified ||
+    error.code === RpcErrorCode.RpcNeedsReconnect
+}
+
+const isLevelNotFoundError = (error: unknown): boolean => {
+  if (typeof error === 'string') {
+    return error.includes('Level not found')
+  }
+  if (error && typeof error === 'object' && 'message' in error) {
+    return typeof (error as { message?: string }).message === 'string' &&
+      (error as { message?: string }).message?.includes('Level not found')
+  }
+  return false
+}
+
+export type LoadGoalsResult = 'loaded' | 'retry' | 'cooldown'
+
+const levelNotFoundCooldownMs = 5000
+const levelNotFoundCooldownUntil = new Map<string, number>()
+const retryCooldownBaseMs = 1000
+const retryCooldownMaxMs = 10000
+const retryCooldownUntil = new Map<string, number>()
+const retryCooldownMs = new Map<string, number>()
+const minRequestIntervalMs = 250
+const lastRequestAt = new Map<string, number>()
+const inFlightRequests = new Map<string, Promise<LoadGoalsResult>>()
+
+export const getLevelNotFoundRetryDelayMs = (uri: string): number => {
+  if (!uri) {
+    return 0
+  }
+  const until = levelNotFoundCooldownUntil.get(uri)
+  if (!until) {
+    return 0
+  }
+  const remaining = until - Date.now()
+  return remaining > 0 ? remaining : 0
+}
+
+const getRetryCooldownMs = (uri: string): number => {
+  if (!uri) {
+    return 0
+  }
+  const until = retryCooldownUntil.get(uri)
+  if (!until) {
+    return 0
+  }
+  const remaining = until - Date.now()
+  return remaining > 0 ? remaining : 0
+}
+
+const markLevelNotFound = (uri: string) => {
+  if (!uri) {
+    return
+  }
+  levelNotFoundCooldownUntil.set(uri, Date.now() + levelNotFoundCooldownMs)
+}
+
+const markRetryCooldown = (uri: string) => {
+  if (!uri) {
+    return
+  }
+  const current = retryCooldownMs.get(uri) ?? retryCooldownBaseMs
+  retryCooldownUntil.set(uri, Date.now() + current)
+  retryCooldownMs.set(uri, Math.min(current * 2, retryCooldownMaxMs))
+}
+
+const clearRetryCooldown = (uri: string) => {
+  if (!uri) {
+    return
+  }
+  retryCooldownMs.delete(uri)
+  retryCooldownUntil.delete(uri)
+}
+
+export type LoadGoalsOptions = {
+  shouldApply?: () => boolean
+  delayMs?: number
+}
+
 export function loadGoals(
   rpcSess: RpcSessionAtPos,
   uri: string,
   worldId: string,
   levelId: number,
   setProof: React.Dispatch<React.SetStateAction<ProofState>>,
-  setCrashed: React.Dispatch<React.SetStateAction<Boolean>>) {
-console.info('sending rpc request to load the proof state')
+  setCrashed: React.Dispatch<React.SetStateAction<Boolean>>,
+  options?: LoadGoalsOptions): Promise<LoadGoalsResult> {
+  const shouldApply = options?.shouldApply
+  if (shouldApply && !shouldApply()) {
+    return Promise.resolve('cooldown')
+  }
+  const inFlight = inFlightRequests.get(uri)
+  if (inFlight) {
+    return inFlight
+  }
+  const cooldownMs = getLevelNotFoundRetryDelayMs(uri)
+  if (cooldownMs > 0) {
+    return Promise.resolve('cooldown')
+  }
+  const retryDelayMs = getRetryCooldownMs(uri)
+  if (retryDelayMs > 0) {
+    return Promise.resolve('cooldown')
+  }
 
-rpcSess.call('Game.getProofState',
-    {
-        ...DocumentPosition.toTdpp({line: 0, character: 0, uri: uri}),
-        worldId, levelId
-    }
-).then(
-  (proof : ProofState) => {
-    if (typeof proof !== 'undefined') {
-      console.info(`received a proof state!`)
-      console.log(proof)
-      setProof(proof)
-      setCrashed(false)
-    } else {
-      console.warn('received undefined proof state!')
-      // Avoid transient crash state while the server warms up.
-    }
+const parsed = parseWorldLevelUri(uri)
+if (!parsed) {
+  return Promise.resolve('retry')
+}
+const resolvedWorldId = parsed.worldId
+const resolvedLevelId = parsed.levelId
+if (!resolvedWorldId || !Number.isFinite(resolvedLevelId)) {
+  return Promise.resolve('retry')
+}
+
+const requestInfo = {
+  uri,
+  worldId: resolvedWorldId,
+  levelId: resolvedLevelId,
+}
+
+const delayMs = options?.delayMs ?? 0
+const issueRequest = () => {
+  const lastAt = lastRequestAt.get(uri) ?? 0
+  if (Date.now() - lastAt < minRequestIntervalMs) {
+    return Promise.resolve('cooldown')
   }
-).catch((error) => {
-  if (error === 'No connection to Lean') {
+  lastRequestAt.set(uri, Date.now())
+  console.info('sending rpc request to load the proof state', requestInfo)
+  return rpcSess.call('Game.getProofState',
+      {
+          ...DocumentPosition.toTdpp({line: 0, character: 0, uri: uri}),
+          worldId: resolvedWorldId,
+          levelId: resolvedLevelId
+      }
+  ).then(
+    (proof : ProofState) => {
+      if (shouldApply && !shouldApply()) {
+        return 'cooldown'
+      }
+      if (typeof proof !== 'undefined') {
+        console.info(`received a proof state!`)
+        console.log(proof)
+        setProof(normalizeProofState(proof))
+        setCrashed(false)
+        clearRetryCooldown(uri)
+        levelNotFoundCooldownUntil.delete(uri)
+        return 'loaded'
+      } else {
+        console.warn('received undefined proof state!')
+        markRetryCooldown(uri)
+        // Avoid transient crash state while the server warms up.
+        return 'retry'
+      }
+    }
+  ).catch((error) => {
+    if (shouldApply && !shouldApply()) {
+      return 'cooldown'
+    }
+    if (isNoConnectionError(error)) {
+      markRetryCooldown(uri)
+      console.warn(error)
+      return 'retry'
+    }
+    if (isClosedFileError(error)) {
+      markRetryCooldown(uri)
+      return 'retry'
+    }
+    if (isRetryableRpcError(error)) {
+      markRetryCooldown(uri)
+      return 'retry'
+    }
+    if (isLevelNotFoundError(error)) {
+      markLevelNotFound(uri)
+      console.warn('Level not found for proof request', requestInfo, error)
+      return 'cooldown'
+    }
+    setCrashed(true)
+    markRetryCooldown(uri)
     console.warn(error)
-    return
+    return 'retry'
+  })
+}
+
+const requestPromise = delayMs > 0
+  ? new Promise<void>(resolve => window.setTimeout(resolve, delayMs)).then(() => {
+      if (shouldApply && !shouldApply()) {
+        return 'cooldown'
+      }
+      return issueRequest()
+    })
+  : issueRequest()
+
+inFlightRequests.set(uri, requestPromise)
+
+return requestPromise.finally(() => {
+  if (inFlightRequests.get(uri) === requestPromise) {
+    inFlightRequests.delete(uri)
   }
-  setCrashed(true)
-  console.warn(error)
 })
 }
 
